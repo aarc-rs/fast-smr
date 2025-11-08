@@ -104,9 +104,9 @@ impl<'a, T, const N: usize> Iterator for ULLIter<'a, T, N> {
 mod tests {
     use crate::utils::{ULLNode, ULL};
     use std::array::from_fn;
-    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-    use std::thread;
+    use std::sync::atomic::{AtomicBool, AtomicPtr};
+    use std::{ptr, thread};
 
     #[test]
     fn test_concurrent_mutate_miri() {
@@ -119,6 +119,10 @@ mod tests {
         test_concurrent_mutate::<3, 24, 3>();
     }
 
+    fn try_claim_slot(slot: &AtomicBool) -> bool {
+        slot.compare_exchange(false, true, SeqCst, Relaxed).is_ok()
+    }
+
     fn test_concurrent_mutate<const N: usize, const T: usize, const I: usize>() {
         let ull: ULL<AtomicBool, N> = ULL {
             head: ULLNode {
@@ -126,10 +130,6 @@ mod tests {
                 next: Default::default(),
             },
         };
-
-        fn try_claim_slot(slot: &AtomicBool) -> bool {
-            slot.compare_exchange(false, true, SeqCst, Relaxed).is_ok()
-        }
 
         thread::scope(|scope| {
             for _ in 0..T {
@@ -151,5 +151,40 @@ mod tests {
         for slot in ull.into_iter() {
             assert!(!slot.load(Relaxed));
         }
+    }
+
+    #[test]
+    fn test_ull_apply_expands_nodes() {
+        let ull: ULL<AtomicBool, 2> = ULL {
+            head: ULLNode {
+                items: from_fn(|_| AtomicBool::default()),
+                next: AtomicPtr::default(),
+            },
+        };
+
+        // Mark all slots in head as taken
+        for slot in ull.head.items.iter() {
+            slot.store(true, Relaxed);
+        }
+
+        // This should trigger node expansion since no slot in head matches
+        _ = ull.apply(try_claim_slot);
+        assert!(!ull.head.next.load(Relaxed).is_null());
+    }
+
+    #[test]
+    fn test_ull_node_get_or_init_next() {
+        let node: ULLNode<AtomicBool, 2> = ULLNode {
+            items: from_fn(|_| AtomicBool::default()),
+            next: AtomicPtr::default(),
+        };
+
+        // First call should create a new node
+        let next1 = node.get_or_init_next();
+        assert!(!node.next.load(Relaxed).is_null());
+
+        // Second call should return the same node
+        let next2 = node.get_or_init_next();
+        assert!(ptr::eq(next1, next2));
     }
 }
