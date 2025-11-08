@@ -1,278 +1,343 @@
-use std::cell::RefCell;
-use std::cmp::max;
+use crate::utils::ULL;
+use std::alloc::Layout;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
-use std::mem::{take, zeroed};
-use std::num::NonZero;
-use std::ptr::NonNull;
+use std::mem;
+use std::mem::zeroed;
+use std::ptr::{null_mut, NonNull};
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64};
-use std::thread::available_parallelism;
-
-use crate::utils::{Stack, ULL};
+use std::sync::atomic::{AtomicPtr, AtomicU64};
 
 const SLOTS_PER_NODE: usize = 8;
 
-struct Reclaimer {
+pub struct Reclaimer {
     slots: ULL<Slot, SLOTS_PER_NODE>,
-    era: AtomicU64,
-
-    // limbo lists may be transferred here on drop.
-    drop_cache: Stack<Vec<RetiredFn>>,
+    epoch: AtomicU64,
+    tag: AtomicU64,
 }
 
-pub fn join(cleanup_freq: usize) -> ThreadContext {
-    let mut node = &RECLAIMER.slots.head;
-    let mut index = 0;
-    // iterate until we successfully claim a slot, expanding the list as necessary.
-    loop {
-        if index > 0 && index % SLOTS_PER_NODE == 0 {
-            node = unsafe { node.get_or_init_next() };
-        }
-        if node.items[index % SLOTS_PER_NODE].try_claim() {
-            break;
-        }
-        index += 1;
+impl Reclaimer {
+    pub const fn new() -> Self {
+        unsafe { zeroed() }
     }
-    // set len to max(len, index + 1).
-    let mut len = RECLAIMER.slots.len.load(SeqCst);
-    while index + 1 > len {
-        match RECLAIMER
-            .slots
-            .len
-            .compare_exchange(len, index + 1, SeqCst, SeqCst)
-        {
-            Ok(_) => break,
-            Err(l) => len = l,
+
+    pub fn claim_slot(&self, cleanup_freq: usize) -> ThreadContext<'_> {
+        let slot = self.slots.apply(Slot::try_claim);
+        ThreadContext {
+            reclaimer: self,
+            slot,
+            cleanup_freq,
+            cleanup_counter: 0,
+            limbo_list: unsafe {
+                if let Some(b) = mem::take(&mut *slot.limbo_list.get()) {
+                    b.into_vec()
+                } else {
+                    Vec::default()
+                }
+            },
+            counts: RefCell::new(Default::default()),
+            snapshot_intervals: vec![],
+            snapshot_ptrs: vec![],
         }
     }
-    ThreadContext {
-        slot: &node.items[index % SLOTS_PER_NODE],
-        index,
-        cleanup_freq,
-        cleanup_counter: 0,
-        counts: VecDeque::default(),
-        intervals: Vec::default(),
-        ready_to_drop: Vec::default(),
+
+    pub fn alloc<T>(&self, x: T) -> *mut WithBirthEpoch<T> {
+        Box::into_raw(Box::new(WithBirthEpoch {
+            birth_epoch: self.epoch.load(SeqCst),
+            data: x,
+        }))
     }
 }
 
-static RECLAIMER: Reclaimer = Reclaimer {
-    slots: unsafe { zeroed() },
-    era: AtomicU64::new(1),
-    drop_cache: Stack::new(),
-};
+impl Default for Reclaimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-/// See: https://docs.rs/crossbeam-utils/latest/src/crossbeam_utils/cache_padded.rs.html
-#[cfg_attr(
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "powerpc64",
-    ),
-    repr(align(128))
-)]
-#[cfg_attr(
-    any(
-        target_arch = "arm",
-        target_arch = "mips",
-        target_arch = "mips32r6",
-        target_arch = "mips64",
-        target_arch = "mips64r6",
-        target_arch = "sparc",
-        target_arch = "hexagon",
-    ),
-    repr(align(32))
-)]
-#[cfg_attr(target_arch = "m68k", repr(align(16)))]
-#[cfg_attr(target_arch = "s390x", repr(align(256)))]
-#[cfg_attr(
-    not(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "powerpc64",
-        target_arch = "arm",
-        target_arch = "mips",
-        target_arch = "mips32r6",
-        target_arch = "mips64",
-        target_arch = "mips64r6",
-        target_arch = "sparc",
-        target_arch = "hexagon",
-        target_arch = "m68k",
-        target_arch = "s390x",
-    )),
-    repr(align(64))
-)]
 struct Slot {
-    start_era: AtomicU64,
-    end_era: AtomicU64,
-    is_claimed: AtomicBool,
+    start_epoch: AtomicU64,
+    end_epoch: AtomicU64,
+    help_ptr: AtomicPtr<AtomicPtr<WithBirthEpoch<()>>>,
+    hazard_ptr: AtomicPtr<WithBirthEpoch<()>>,
+
+    limbo_list: UnsafeCell<Option<Box<[RetiredFn]>>>,
 }
 
 impl Slot {
+    const UNCLAIMED: u64 = u64::MAX;
+    const NO_RESERVE: u64 = u64::MAX - 1;
+
+    const fn new() -> Self {
+        Self {
+            start_epoch: AtomicU64::new(Self::NO_RESERVE),
+            end_epoch: AtomicU64::new(Self::UNCLAIMED),
+            help_ptr: AtomicPtr::new(null_mut()),
+            hazard_ptr: AtomicPtr::new(null_mut()),
+            limbo_list: UnsafeCell::new(None),
+        }
+    }
+
     fn try_claim(&self) -> bool {
-        self.is_claimed
-            .compare_exchange(false, true, SeqCst, Relaxed)
+        self.end_epoch
+            .compare_exchange(Self::UNCLAIMED, Self::NO_RESERVE, SeqCst, Relaxed)
             .is_ok()
     }
 }
 
-thread_local! {
-    static CTX: RefCell<ThreadContext> = RefCell::new(join(available_parallelism().map_or(32, NonZero::get)));
-    static LIMBO_LIST: RefCell<LocalLimboList> = RefCell::new(LocalLimboList::new());
-}
-
-struct LocalLimboList(Vec<RetiredFn>);
-
-impl LocalLimboList {
-    fn new() -> Self {
-        Self(
-            RECLAIMER
-                .drop_cache
-                .take_all()
-                .into_iter()
-                .flatten()
-                .collect(),
-        )
+impl Default for Slot {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl Drop for LocalLimboList {
-    fn drop(&mut self) {
-        if !self.0.is_empty() {
-            RECLAIMER.drop_cache.insert(take(&mut self.0));
-        }
-    }
-}
+unsafe impl Send for Slot {}
+unsafe impl Sync for Slot {}
 
-pub struct ThreadContext {
-    slot: &'static Slot,
-    index: usize,
+pub struct ThreadContext<'a> {
+    reclaimer: &'a Reclaimer,
+    slot: &'a Slot,
 
     cleanup_freq: usize,
     cleanup_counter: usize,
 
-    // a monotonically increasing queue consisting of (era, count) tuples.
-    counts: VecDeque<(u64, usize)>,
-    // a reusable Vec for storing hazardous intervals when scanning slots.
-    intervals: Vec<(u64, u64)>,
-    // a reusable Vec for storing items that are ready to be dropped.
-    ready_to_drop: Vec<RetiredFn>,
+    limbo_list: Vec<RetiredFn>,
+
+    // a monotonically increasing queue consisting of (epoch, count) tuples.
+    counts: RefCell<VecDeque<(u64, usize)>>,
+
+    // reusable lists for storing snapshots when scanning slots during retirement.
+    snapshot_intervals: Vec<(u64, u64)>,
+    snapshot_ptrs: Vec<*mut ()>,
 }
 
-pub fn load<T>(src: &AtomicPtr<T>) -> Option<Guard<T>> {
-    protect(src, NonNull::new(src.load(SeqCst))?)
-}
+impl<'a> ThreadContext<'a> {
+    pub fn load<T>(
+        &mut self,
+        src: &AtomicPtr<WithBirthEpoch<T>>,
+        attempts: usize,
+    ) -> Option<Guard<'a, '_, T>> {
+        match NonNull::new(src.load(SeqCst)) {
+            Some(initial) => self.protect(src, initial, attempts),
+            None => None,
+        }
+    }
 
-pub fn protect<T>(src: &AtomicPtr<T>, ptr: NonNull<T>) -> Option<Guard<T>> {
-    let mut initial_end_era = 0;
-    let mut era = RECLAIMER.era.load(SeqCst);
-    CTX.with_borrow_mut(|ctx| {
-        if let Some(back) = ctx.counts.back_mut() {
-            initial_end_era = back.0;
-            if initial_end_era == era {
-                // the current era was already protected by a previous call to this method.
-                // simply increment the count of the last protected era.
+    fn protect<T>(
+        &mut self,
+        src: &AtomicPtr<WithBirthEpoch<T>>,
+        initial: NonNull<WithBirthEpoch<T>>,
+        attempts: usize,
+    ) -> Option<Guard<'a, '_, T>> {
+        let mut counts = self.counts.borrow_mut();
+        let mut ptr = initial;
+        let mut curr_epoch = self.reclaimer.epoch.load(SeqCst);
+        let mut initial_end_epoch = Slot::NO_RESERVE;
+
+        // if curr_epoch was already protected, simply increment the count in our local tracker.
+        if let Some(back) = counts.back_mut() {
+            initial_end_epoch = back.0;
+            if initial_end_epoch == curr_epoch {
                 back.1 += 1;
-                return Some(Guard { era, ptr });
+                return Some(Guard {
+                    ctx: self,
+                    epoch: curr_epoch,
+                    ptr,
+                });
             }
         }
-        ctx.slot.end_era.store(era, SeqCst);
-        while let Some(ptr) = NonNull::new(src.load(SeqCst)) {
-            let next_era = RECLAIMER.era.load(SeqCst);
-            if era == next_era {
-                ctx.counts.push_back((era, 1));
-                if ctx.counts.len() == 1 {
-                    // this is our first reservation, so start_era must also be updated.
-                    ctx.slot.start_era.store(era, SeqCst);
+
+        // set end_epoch to curr_epoch in accordance with 2GEIBR
+        self.slot.end_epoch.store(curr_epoch, SeqCst);
+
+        // try the fast path
+        for _ in 0..attempts {
+            ptr = match NonNull::new(src.load(SeqCst)) {
+                Some(p) => p,
+                None => {
+                    // null ptrs don't need protection. reset end_epoch to what it was originally.
+                    self.slot.end_epoch.store(initial_end_epoch, SeqCst);
+                    return None;
                 }
-                return Some(Guard { era, ptr });
+            };
+            self.slot.end_epoch.store(curr_epoch, SeqCst);
+
+            let reloaded_epoch = self.reclaimer.epoch.load(SeqCst);
+            if curr_epoch == reloaded_epoch {
+                if counts.is_empty() {
+                    // this is our first reservation, so start_epoch must also be updated.
+                    self.slot.start_epoch.store(curr_epoch, SeqCst);
+                }
+                counts.push_back((curr_epoch, 1));
+                return Some(Guard {
+                    ctx: self,
+                    epoch: curr_epoch,
+                    ptr,
+                });
             }
-            era = next_era;
-            ctx.slot.end_era.store(era, SeqCst);
+            curr_epoch = reloaded_epoch;
         }
-        // null ptrs don't need protection; reset end_era to what it was before.
-        ctx.slot.end_era.store(initial_end_era, SeqCst);
-        None
-    })
-}
 
-pub fn retire(ptr: NonNull<u8>, f: fn(NonNull<u8>), birth_era: u64) {
-    CTX.with(|ref_cell| {
-        if let Ok(mut ctx) = ref_cell.try_borrow_mut() {
-            ctx.cleanup_counter = (ctx.cleanup_counter + 1) % ctx.cleanup_freq;
-            if ctx.cleanup_counter == 0 {
-                ctx.scan_and_cleanup();
+        // fall back to the slow path. first, publish the parent block.
+        let help = src as *const _ as *const () as *mut AtomicPtr<WithBirthEpoch<()>>;
+        self.slot.help_ptr.store(help, SeqCst);
+
+        // set the low bit to signal that we need help
+        let tag = (self.reclaimer.tag.fetch_add(1, SeqCst) << 1) | 1;
+        self.slot.hazard_ptr.store(tag as *mut _, SeqCst);
+
+        // load the target ourselves
+        let mut loaded_ptr = src.load(SeqCst);
+
+        // publish the hazardous pointer, or check to see if anyone helped us
+        if let Err(helped) = self.slot.hazard_ptr.compare_exchange(
+            tag as *mut _,
+            loaded_ptr as *mut _,
+            SeqCst,
+            SeqCst,
+        ) {
+            loaded_ptr = helped as *mut _;
+        }
+
+        // similar to the above case, null pointers don't need protection.
+        ptr = match NonNull::new(loaded_ptr) {
+            Some(p) => p,
+            None => {
+                self.slot.hazard_ptr.store(null_mut(), SeqCst); // clear the help flag
+                self.slot.end_epoch.store(initial_end_epoch, SeqCst);
+                return None;
             }
+        };
+
+        // protect the current epoch; the target is guaranteed to be alive during this epoch
+        // because we already protected it using the hazard pointer
+        curr_epoch = self.reclaimer.epoch.load(SeqCst);
+        self.slot.end_epoch.store(curr_epoch, SeqCst);
+        self.slot.hazard_ptr.store(null_mut(), SeqCst); // clear the help flag
+        if counts.is_empty() {
+            // this is our first reservation, so start_epoch must also be updated.
+            self.slot.start_epoch.store(curr_epoch, SeqCst);
         }
-    });
-    let retire_era = RECLAIMER.era.load(SeqCst);
-    let r = RetiredFn {
-        ptr,
-        f,
-        span: (birth_era, retire_era),
-    };
-    LIMBO_LIST.with_borrow_mut(|list| list.0.push(r));
-}
+        counts.push_back((curr_epoch, 1));
+        Some(Guard {
+            ctx: self,
+            epoch: curr_epoch,
+            ptr,
+        })
+    }
 
-pub fn increment_era() {
-    RECLAIMER.era.fetch_add(1, SeqCst);
-}
+    pub fn retire(
+        &mut self,
+        ptr: NonNull<WithBirthEpoch<()>>,
+        layout: Layout,
+        f: fn(NonNull<WithBirthEpoch<()>>, layout: Layout),
+    ) {
+        self.cleanup_counter = (self.cleanup_counter + 1) % self.cleanup_freq;
+        let retire_epoch = if self.cleanup_counter == 0 {
+            self.scan_and_cleanup();
+            self.reclaimer.epoch.fetch_add(1, SeqCst)
+        } else {
+            self.reclaimer.epoch.load(SeqCst)
+        };
+        let birth_epoch = unsafe { (*ptr.as_ptr()).birth_epoch };
+        let span = (birth_epoch, retire_epoch);
+        self.limbo_list.push(RetiredFn {
+            ptr,
+            layout,
+            f,
+            span,
+        });
+    }
 
-pub fn load_era() -> u64 {
-    RECLAIMER.era.load(SeqCst)
-}
-
-impl ThreadContext {
     fn scan_and_cleanup(&mut self) {
-        // scan the global array of reservations.
-        for slot in RECLAIMER.slots.into_iter() {
-            let end = slot.end_era.load(SeqCst);
-            if end == 0 {
-                // this thread has no reservations.
+        // scan all slots.
+        for slot in self.reclaimer.slots.into_iter() {
+            let end = slot.end_epoch.load(SeqCst);
+            if end == Slot::UNCLAIMED || end == Slot::NO_RESERVE {
                 continue;
             }
-            let mut start = slot.start_era.load(SeqCst);
-            if start == 0 {
-                // this slot has one reservation, defined by end_era.
+            let mut start = slot.start_epoch.load(SeqCst);
+            if start == Slot::NO_RESERVE {
+                // this slot has one reservation, defined by end_epoch.
                 start = end;
             }
-            self.intervals.push((start, end));
+            self.snapshot_intervals.push((start, end));
+
+            // helping procedure
+            let loaded = slot.hazard_ptr.load(SeqCst);
+            if loaded.is_null() {
+                continue;
+            } else if loaded as usize & 1 == 1 {
+                // if the low bit is set, they need help
+                let help_ptr = slot.help_ptr.load(SeqCst);
+                self.slot.hazard_ptr.store(help_ptr as *mut _, SeqCst);
+                if slot.hazard_ptr.load(SeqCst) == loaded {
+                    // make sure it didn't change
+                    let tgt = unsafe { (*help_ptr).load(SeqCst) };
+                    _ = slot
+                        .hazard_ptr
+                        .compare_exchange(loaded, tgt, SeqCst, Relaxed);
+                    self.snapshot_ptrs.push(tgt as *mut _);
+                }
+                self.slot.hazard_ptr.store(null_mut(), SeqCst);
+            } else {
+                self.snapshot_ptrs.push(loaded as *mut _);
+            }
         }
 
+        /*
         // merge the intervals.
-        if self.intervals.len() > 1 {
-            self.intervals.sort_unstable();
+        if self.snapshot_intervals.len() > 1 {
+            self.snapshot_intervals.sort_unstable();
             let mut i = 1;
-            for j in 1..self.intervals.len() {
-                let (start, end) = self.intervals[j];
+            for j in 1..self.snapshot_intervals.len() {
+                let (start, end) = self.snapshot_intervals[j];
                 // [(1, 2), (3, 4)] can be merged into [(1, 4)].
-                if start <= self.intervals[i - 1].1 + 1 {
-                    self.intervals[i - 1].1 = max(end, self.intervals[i - 1].1);
+                if start <= self.snapshot_intervals[i - 1].1 + 1 {
+                    self.snapshot_intervals[i - 1].1 = max(end, self.snapshot_intervals[i - 1].1);
                 } else {
-                    self.intervals[i] = (start, end);
+                    self.snapshot_intervals[i] = (start, end);
                     i += 1;
                 }
             }
-            self.intervals.truncate(i);
+            self.snapshot_intervals.truncate(i);
+        }
+        */
+
+        let mut i = 0;
+        while i < self.limbo_list.len() {
+            let mut has_conflict = self
+                .snapshot_intervals
+                .iter()
+                .any(|x| intervals_overlap(self.limbo_list[i].span, *x));
+            for snapshot_ptr in self.snapshot_ptrs.iter() {
+                let block_start = self.limbo_list[i].ptr.as_ptr() as usize;
+                let block_end = block_start + self.limbo_list[i].layout.size();
+                let hazard_addr = *snapshot_ptr as usize;
+                has_conflict |= (block_start <= hazard_addr) && (hazard_addr < block_end);
+                if has_conflict {
+                    break;
+                }
+            }
+            if has_conflict {
+                i += 1;
+            } else {
+                self.limbo_list.swap_remove(i);
+            }
         }
 
-        LIMBO_LIST.with_borrow_mut(|list| {
-            // go through the limbo list and delete the entries without conflicts.
-            let mut i = 0;
-            while i < list.0.len() {
-                let has_conflict = self
-                    .intervals
-                    .iter()
-                    .any(|x| intervals_overlap(list.0[i].span, *x));
-                if has_conflict {
-                    i += 1;
-                } else {
-                    self.ready_to_drop.push(list.0.swap_remove(i));
-                }
-            }
-        });
-        self.ready_to_drop.clear();
-        self.intervals.clear();
+        self.snapshot_intervals.clear();
+        self.snapshot_ptrs.clear();
+    }
+}
+
+impl<'a> Drop for ThreadContext<'a> {
+    fn drop(&mut self) {
+        self.scan_and_cleanup();
+        unsafe {
+            *self.slot.limbo_list.get() = Some(mem::take(&mut self.limbo_list).into_boxed_slice());
+        }
+        self.slot.end_epoch.store(Slot::UNCLAIMED, SeqCst);
     }
 }
 
@@ -280,169 +345,169 @@ fn intervals_overlap(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 <= b.1 && b.0 <= a.1
 }
 
-impl Drop for ThreadContext {
-    fn drop(&mut self) {
-        let mut nodes = vec![&RECLAIMER.slots.head];
-        while let Some(next) = unsafe { nodes.last().unwrap().next.load(SeqCst).as_ref() } {
-            nodes.push(next);
-        }
-        for i in (0..self.index + 1).rev() {
-            let slot = &nodes[i / SLOTS_PER_NODE].items[i % SLOTS_PER_NODE];
-            // temporarily claim the slot for purposes of shrinking the list length.
-            if i < self.index && !slot.try_claim() {
-                break;
-            }
-            let succeeded = RECLAIMER
-                .slots
-                .len
-                .compare_exchange(i + 1, i, SeqCst, SeqCst)
-                .is_ok();
-            slot.is_claimed.store(false, SeqCst);
-            if !succeeded {
-                break;
-            }
-        }
+#[repr(C)]
+pub struct WithBirthEpoch<T> {
+    birth_epoch: u64,
+    data: T,
+}
+
+pub struct Guard<'a: 'b, 'b, T> {
+    ctx: &'b ThreadContext<'a>,
+    ptr: NonNull<WithBirthEpoch<T>>,
+    epoch: u64,
+}
+
+impl<'a: 'b, 'b, T> AsRef<T> for Guard<'a, 'b, T> {
+    fn as_ref(&self) -> &T {
+        unsafe { &(*self.ptr.as_ptr()).data }
     }
 }
 
-pub struct Guard<T> {
-    era: u64,
-    ptr: NonNull<T>,
-}
-
-impl<T> Guard<T> {
-    pub fn as_ptr(&self) -> *mut T {
-        self.ptr.as_ptr()
-    }
-}
-
-impl<T> Drop for Guard<T> {
+impl<'a: 'b, 'b, T> Drop for Guard<'a, 'b, T> {
     fn drop(&mut self) {
-        CTX.with_borrow_mut(|ctx| {
-            // decrement the count.
-            let pair = ctx.counts.iter_mut().find(|(e, _)| *e == self.era).unwrap();
-            pair.1 -= 1;
+        let mut counts = self.ctx.counts.borrow_mut();
+        debug_assert_ne!(counts.len(), 0);
 
-            let mut start_era_changed = false;
-            let mut end_era_changed = false;
+        // decrement the count.
+        let pair = counts.iter_mut().find(|(e, _)| *e == self.epoch).unwrap();
+        debug_assert!(pair.1 > 0);
+        pair.1 -= 1;
 
-            // pop from the front and back of the queue to shrink the interval.
-            while let Some((_, count)) = ctx.counts.front() {
-                if *count > 0 {
-                    break;
-                }
-                ctx.counts.pop_front();
-                start_era_changed = true;
+        let mut start_epoch_changed = false;
+        let mut end_epoch_changed = false;
+        // pop from the front and back of the queue to shrink the interval.
+        while let Some((_, count)) = counts.front() {
+            if *count > 0 {
+                break;
             }
-            while let Some((_, count)) = ctx.counts.back() {
-                if *count > 0 {
-                    break;
-                }
-                ctx.counts.pop_back();
-                end_era_changed = true;
+            counts.pop_front();
+            start_epoch_changed = true;
+        }
+        while let Some((_, count)) = counts.back() {
+            if *count > 0 {
+                break;
             }
+            counts.pop_back();
+            end_epoch_changed = true;
+        }
 
-            // update our interval.
-            if ctx.counts.is_empty() {
-                // we have no more reservations; zero out our interval.
-                ctx.slot.end_era.store(0, SeqCst);
-                ctx.slot.start_era.store(0, SeqCst);
-            } else if start_era_changed {
-                ctx.slot
-                    .start_era
-                    .store(ctx.counts.front().unwrap().0, SeqCst);
-            } else if end_era_changed {
-                ctx.slot.end_era.store(ctx.counts.back().unwrap().0, SeqCst);
+        if counts.is_empty() {
+            // we have no more reservations; zero out our interval.
+            self.ctx.slot.end_epoch.store(Slot::NO_RESERVE, SeqCst);
+            self.ctx.slot.start_epoch.store(Slot::NO_RESERVE, SeqCst);
+        } else {
+            if start_epoch_changed {
+                self.ctx
+                    .slot
+                    .start_epoch
+                    .store(counts.front().unwrap().0, SeqCst);
             }
-        });
+            if end_epoch_changed {
+                self.ctx
+                    .slot
+                    .end_epoch
+                    .store(counts.back().unwrap().0, SeqCst);
+            }
+        }
     }
 }
 
 struct RetiredFn {
-    ptr: NonNull<u8>,
-    f: fn(NonNull<u8>),
+    ptr: NonNull<WithBirthEpoch<()>>,
+    layout: Layout,
+    f: fn(NonNull<WithBirthEpoch<()>>, Layout),
     span: (u64, u64),
 }
 
 impl Drop for RetiredFn {
     fn drop(&mut self) {
-        (self.f)(self.ptr);
+        (self.f)(self.ptr, self.layout);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::mem::zeroed;
-    use std::ptr::NonNull;
+    use std::alloc::{dealloc, Layout};
+    use std::ptr::{null_mut, NonNull};
     use std::sync::atomic::Ordering::{Relaxed, SeqCst};
     use std::sync::atomic::{AtomicPtr, AtomicUsize};
-    use std::thread;
+    use std::{array, thread};
 
-    use crate::smr::{increment_era, load, load_era, retire};
+    use crate::smr::{Reclaimer, WithBirthEpoch};
 
     #[test]
     fn test_protect_retire_miri() {
-        test_protect_retire::<5, 30>();
+        basic_test_1::<5, 100>();
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_protect_retire_no_miri() {
-        test_protect_retire::<64, 50>();
+        basic_test_1::<64, 200>();
     }
 
-    struct Obj<T> {
-        val: T,
-        birth_era: u64,
-    }
+    const LAYOUT: Layout = Layout::new::<WithBirthEpoch<usize>>();
 
-    fn test_protect_retire<const THREADS: usize, const MAX_VAL: usize>() {
-        let counts: [AtomicUsize; MAX_VAL] = unsafe { zeroed() };
-        let x = AtomicPtr::new(Box::into_raw(Box::new(Obj {
-            val: 0,
-            birth_era: load_era(),
-        })));
+    fn basic_test_1<const THREADS: usize, const MAX_VAL: usize>() {
+        // basic tests:
+        // results1: each thread loads x, incrementing results[x.load()] by 1.
+        let results1: [AtomicUsize; MAX_VAL] = array::from_fn(|_| AtomicUsize::new(0));
+        // results2: each thread swaps x, incrementing results[x.swap(...)] by 1.
+        let results2: [AtomicUsize; MAX_VAL] = array::from_fn(|_| AtomicUsize::new(0));
+        let reclaimer = Reclaimer::new();
 
+        let x = AtomicPtr::<WithBirthEpoch<usize>>::new(null_mut());
+
+        let logic = || {
+            let mut ctx = reclaimer.claim_slot(1);
+            for val in 0..MAX_VAL {
+                if let Some(guard) = ctx.load(&x, 1) {
+                    results1[*guard.as_ref()].fetch_add(1, Relaxed);
+                }
+                let new_item = reclaimer.alloc(val);
+                let swapped = x.swap(new_item, SeqCst);
+                if let Some(to_retire) = NonNull::new(swapped as *mut _) {
+                    unsafe {
+                        results2[(*swapped).data].fetch_add(1, Relaxed);
+                    }
+                    // immediately retire the object we swapped out
+                    ctx.retire(to_retire, LAYOUT, dealloc_box_ptr);
+                }
+            }
+        };
+
+        // spawn some threads to run the logic concurrently
         thread::scope(|scope| {
             for _ in 0..THREADS {
-                scope.spawn(|| {
-                    for val in 0..MAX_VAL {
-                        if let Some(guard) = load(&x) {
-                            unsafe {
-                                counts[(*guard.as_ptr()).val].fetch_add(1, Relaxed);
-                            }
-                        }
-                        let obj = Obj {
-                            val,
-                            birth_era: load_era(),
-                        };
-                        let swapped = x.swap(Box::into_raw(Box::new(obj)), SeqCst);
-                        if let Some(to_retire) = NonNull::<u8>::new(swapped as *mut u8) {
-                            unsafe {
-                                retire(
-                                    to_retire,
-                                    dealloc_boxed_ptr::<Obj<usize>>,
-                                    (*swapped).birth_era,
-                                );
-                            }
-                        }
-                        increment_era();
-                    }
-                });
+                scope.spawn(logic);
             }
         });
 
-        let total = counts.iter().fold(0, |x, y| x + y.load(Relaxed));
-        assert_eq!(total, THREADS * MAX_VAL);
-
+        // there's still one object stored in x, clean it up for testing purposes
+        let last = x.load(Relaxed);
         unsafe {
-            drop(Box::from_raw(x.load(Relaxed)));
+            results1[(*last).data].fetch_add(1, Relaxed);
+            results2[(*last).data].fetch_add(1, Relaxed);
         }
+        dealloc_box_ptr(NonNull::new(last as *mut _).unwrap(), LAYOUT);
+
+        // sanity checks
+        let total = results1.iter().fold(0, |x, y| x + y.load(Relaxed));
+        assert_eq!(total, THREADS * MAX_VAL);
+        for item in results2.iter() {
+            assert_eq!(item.load(Relaxed), THREADS);
+        }
+
+        println!(
+            "epoch was incremented {} times",
+            reclaimer.epoch.load(Relaxed)
+        );
+        println!("slow path was hit {} times", reclaimer.tag.load(Relaxed));
     }
 
-    fn dealloc_boxed_ptr<T>(p: NonNull<u8>) {
+    fn dealloc_box_ptr(p: NonNull<WithBirthEpoch<()>>, layout: Layout) {
         unsafe {
-            drop(Box::from_raw(p.as_ptr() as *mut T));
+            dealloc(p.as_ptr() as *mut _, layout);
         }
     }
 }
