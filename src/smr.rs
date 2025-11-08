@@ -1,4 +1,3 @@
-use crate::utils::ULL;
 use std::alloc::Layout;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
@@ -7,6 +6,8 @@ use std::mem::zeroed;
 use std::ptr::{null_mut, NonNull};
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::sync::atomic::{AtomicPtr, AtomicU64};
+
+use crate::utils::ULL;
 
 const SLOTS_PER_NODE: usize = 8;
 
@@ -436,6 +437,66 @@ mod tests {
     use crate::smr::{Reclaimer, WithBirthEpoch};
 
     #[test]
+    fn test_concurrent_reader_writer() {
+        const UPDATES: usize = 50;
+        const READERS: usize = 4;
+
+        let reclaimer = Reclaimer::new();
+        let shared_ptr = AtomicPtr::new(reclaimer.alloc(0usize));
+        let reads_completed = AtomicUsize::new(0);
+
+        thread::scope(|scope| {
+            // Writer thread: continuously updates the value
+            scope.spawn(|| {
+                let mut ctx = reclaimer.claim_slot(5);
+                for i in 1..=UPDATES {
+                    let new_val = reclaimer.alloc(i);
+                    let old = shared_ptr.swap(new_val, SeqCst);
+                    if let Some(to_retire) = NonNull::new(old as *mut _) {
+                        ctx.retire(to_retire, LAYOUT, dealloc_box_ptr);
+                    }
+                }
+            });
+
+            // Reader threads: continuously read and verify monotonic increases
+            for _ in 0..READERS {
+                scope.spawn(|| {
+                    let mut ctx = reclaimer.claim_slot(1);
+                    let mut last_seen = 0;
+                    let mut local_reads = 0;
+
+                    while last_seen < UPDATES {
+                        if let Some(guard) = ctx.load(&shared_ptr, 1) {
+                            let val = *guard.as_ref();
+                            // Values should never decrease
+                            assert!(
+                                val >= last_seen,
+                                "Non-monotonic read: {} after {}",
+                                val,
+                                last_seen
+                            );
+                            last_seen = val;
+                            local_reads += 1;
+                        }
+                    }
+
+                    reads_completed.fetch_add(local_reads, SeqCst);
+                });
+            }
+        });
+
+        // Clean up the final value
+        let last = shared_ptr.load(Relaxed);
+        unsafe {
+            assert_eq!((*last).data, UPDATES);
+        }
+        dealloc_box_ptr(NonNull::new(last as *mut _).unwrap(), LAYOUT);
+
+        println!("Total reads completed: {}", reads_completed.load(Relaxed));
+        println!("Epoch increments: {}", reclaimer.epoch.load(Relaxed));
+    }
+
+    #[test]
     fn test_protect_retire_miri() {
         basic_test_1::<5, 100>();
     }
@@ -462,13 +523,13 @@ mod tests {
             let mut ctx = reclaimer.claim_slot(1);
             for val in 0..MAX_VAL {
                 if let Some(guard) = ctx.load(&x, 1) {
-                    results1[*guard.as_ref()].fetch_add(1, Relaxed);
+                    results1[*guard.as_ref()].fetch_add(1, SeqCst);
                 }
                 let new_item = reclaimer.alloc(val);
                 let swapped = x.swap(new_item, SeqCst);
                 if let Some(to_retire) = NonNull::new(swapped as *mut _) {
                     unsafe {
-                        results2[(*swapped).data].fetch_add(1, Relaxed);
+                        results2[(*swapped).data].fetch_add(1, SeqCst);
                     }
                     // immediately retire the object we swapped out
                     ctx.retire(to_retire, LAYOUT, dealloc_box_ptr);
@@ -484,7 +545,7 @@ mod tests {
         });
 
         // there's still one object stored in x, clean it up for testing purposes
-        let last = x.load(Relaxed);
+        let last = x.swap(null_mut(), Relaxed);
         unsafe {
             results1[(*last).data].fetch_add(1, Relaxed);
             results2[(*last).data].fetch_add(1, Relaxed);
@@ -498,11 +559,7 @@ mod tests {
             assert_eq!(item.load(Relaxed), THREADS);
         }
 
-        println!(
-            "epoch was incremented {} times",
-            reclaimer.epoch.load(Relaxed)
-        );
-        println!("slow path was hit {} times", reclaimer.tag.load(Relaxed));
+        println!("Epoch increments: {}", reclaimer.epoch.load(Relaxed));
     }
 
     fn dealloc_box_ptr(p: NonNull<WithBirthEpoch<()>>, layout: Layout) {
