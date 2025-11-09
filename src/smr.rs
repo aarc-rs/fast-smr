@@ -42,11 +42,8 @@ impl Reclaimer {
         }
     }
 
-    pub fn alloc<T>(&self, x: T) -> *mut WithBirthEpoch<T> {
-        Box::into_raw(Box::new(WithBirthEpoch {
-            birth_epoch: self.epoch.load(SeqCst),
-            data: x,
-        }))
+    pub fn current_epoch(&self) -> u64 {
+        self.epoch.load(SeqCst)
     }
 }
 
@@ -59,8 +56,8 @@ impl Default for Reclaimer {
 struct Slot {
     start_epoch: AtomicU64,
     end_epoch: AtomicU64,
-    help_ptr: AtomicPtr<AtomicPtr<WithBirthEpoch<()>>>,
-    hazard_ptr: AtomicPtr<WithBirthEpoch<()>>,
+    help_ptr: AtomicPtr<AtomicPtr<u8>>,
+    hazard_ptr: AtomicPtr<u8>,
 
     limbo_list: UnsafeCell<Option<Box<[RetiredFn]>>>,
 }
@@ -109,15 +106,11 @@ pub struct ThreadContext<'a> {
 
     // reusable lists for storing snapshots when scanning slots during retirement.
     snapshot_intervals: Vec<(u64, u64)>,
-    snapshot_ptrs: Vec<*mut ()>,
+    snapshot_ptrs: Vec<*mut u8>,
 }
 
 impl<'a> ThreadContext<'a> {
-    pub fn load<T>(
-        &mut self,
-        src: &AtomicPtr<WithBirthEpoch<T>>,
-        attempts: usize,
-    ) -> Option<Guard<'a, '_, T>> {
+    pub fn load<T>(&mut self, src: &AtomicPtr<T>, attempts: usize) -> Option<Guard<'a, '_, T>> {
         match NonNull::new(src.load(SeqCst)) {
             Some(initial) => self.protect(src, initial, attempts),
             None => None,
@@ -126,8 +119,8 @@ impl<'a> ThreadContext<'a> {
 
     fn protect<T>(
         &mut self,
-        src: &AtomicPtr<WithBirthEpoch<T>>,
-        initial: NonNull<WithBirthEpoch<T>>,
+        src: &AtomicPtr<T>,
+        initial: NonNull<T>,
         attempts: usize,
     ) -> Option<Guard<'a, '_, T>> {
         let mut counts = self.counts.borrow_mut();
@@ -180,7 +173,7 @@ impl<'a> ThreadContext<'a> {
         }
 
         // fall back to the slow path. first, publish the parent block.
-        let help = src as *const _ as *const () as *mut AtomicPtr<WithBirthEpoch<()>>;
+        let help = src as *const _ as *const () as *mut AtomicPtr<u8>;
         self.slot.help_ptr.store(help, SeqCst);
 
         // set the low bit to signal that we need help
@@ -227,11 +220,13 @@ impl<'a> ThreadContext<'a> {
         })
     }
 
-    pub fn retire(
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn retire(
         &mut self,
-        ptr: NonNull<WithBirthEpoch<()>>,
+        ptr: *mut u8,
         layout: Layout,
-        f: fn(NonNull<WithBirthEpoch<()>>, layout: Layout),
+        f: unsafe fn(*mut u8, Layout),
+        birth_epoch: u64,
     ) {
         self.cleanup_counter = (self.cleanup_counter + 1) % self.cleanup_freq;
         let retire_epoch = if self.cleanup_counter == 0 {
@@ -240,7 +235,6 @@ impl<'a> ThreadContext<'a> {
         } else {
             self.reclaimer.epoch.load(SeqCst)
         };
-        let birth_epoch = unsafe { (*ptr.as_ptr()).birth_epoch };
         let span = (birth_epoch, retire_epoch);
         self.limbo_list.push(RetiredFn {
             ptr,
@@ -250,7 +244,8 @@ impl<'a> ThreadContext<'a> {
         });
     }
 
-    fn scan_and_cleanup(&mut self) {
+    #[allow(clippy::missing_safety_doc)]
+    unsafe fn scan_and_cleanup(&mut self) {
         // scan all slots.
         for slot in self.reclaimer.slots.into_iter() {
             let end = slot.end_epoch.load(SeqCst);
@@ -273,8 +268,8 @@ impl<'a> ThreadContext<'a> {
                 let help_ptr = slot.help_ptr.load(SeqCst);
                 self.slot.hazard_ptr.store(help_ptr as *mut _, SeqCst);
                 if slot.hazard_ptr.load(SeqCst) == loaded {
-                    // make sure it didn't change
-                    let tgt = unsafe { (*help_ptr).load(SeqCst) };
+                    // make sure it didn't change. if it did, they no longer need help.
+                    let tgt = (*help_ptr).load(SeqCst);
                     _ = slot
                         .hazard_ptr
                         .compare_exchange(loaded, tgt, SeqCst, Relaxed);
@@ -312,7 +307,7 @@ impl<'a> ThreadContext<'a> {
                 .iter()
                 .any(|x| intervals_overlap(self.limbo_list[i].span, *x));
             for snapshot_ptr in self.snapshot_ptrs.iter() {
-                let block_start = self.limbo_list[i].ptr.as_ptr() as usize;
+                let block_start = self.limbo_list[i].ptr as usize;
                 let block_end = block_start + self.limbo_list[i].layout.size();
                 let hazard_addr = *snapshot_ptr as usize;
                 has_conflict |= (block_start <= hazard_addr) && (hazard_addr < block_end);
@@ -334,8 +329,8 @@ impl<'a> ThreadContext<'a> {
 
 impl<'a> Drop for ThreadContext<'a> {
     fn drop(&mut self) {
-        self.scan_and_cleanup();
         unsafe {
+            self.scan_and_cleanup();
             *self.slot.limbo_list.get() = Some(mem::take(&mut self.limbo_list).into_boxed_slice());
         }
         self.slot.end_epoch.store(Slot::UNCLAIMED, SeqCst);
@@ -346,21 +341,15 @@ fn intervals_overlap(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 <= b.1 && b.0 <= a.1
 }
 
-#[repr(C)]
-pub struct WithBirthEpoch<T> {
-    birth_epoch: u64,
-    data: T,
-}
-
 pub struct Guard<'a: 'b, 'b, T> {
     ctx: &'b ThreadContext<'a>,
-    ptr: NonNull<WithBirthEpoch<T>>,
+    ptr: NonNull<T>,
     epoch: u64,
 }
 
 impl<'a: 'b, 'b, T> AsRef<T> for Guard<'a, 'b, T> {
     fn as_ref(&self) -> &T {
-        unsafe { &(*self.ptr.as_ptr()).data }
+        unsafe { &(*self.ptr.as_ptr()) }
     }
 }
 
@@ -414,27 +403,46 @@ impl<'a: 'b, 'b, T> Drop for Guard<'a, 'b, T> {
 }
 
 struct RetiredFn {
-    ptr: NonNull<WithBirthEpoch<()>>,
+    ptr: *mut u8,
     layout: Layout,
-    f: fn(NonNull<WithBirthEpoch<()>>, Layout),
+    f: unsafe fn(*mut u8, Layout),
     span: (u64, u64),
 }
 
 impl Drop for RetiredFn {
     fn drop(&mut self) {
-        (self.f)(self.ptr, self.layout);
+        unsafe {
+            (self.f)(self.ptr, self.layout);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::alloc::{dealloc, Layout};
-    use std::ptr::{null_mut, NonNull};
-    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+    use std::ptr::null_mut;
+    use std::sync::atomic::Ordering::SeqCst;
     use std::sync::atomic::{AtomicPtr, AtomicUsize};
     use std::{array, thread};
 
-    use crate::smr::{Reclaimer, WithBirthEpoch};
+    use crate::smr::Reclaimer;
+
+    // Test struct to be allocated on the heap.
+    pub struct Block {
+        birth_epoch: u64,
+        data: usize,
+    }
+
+    impl Block {
+        const LAYOUT: Layout = Layout::new::<Self>();
+
+        fn alloc(reclaimer: &Reclaimer, val: usize) -> *mut Self {
+            Box::into_raw(Box::new(Block {
+                birth_epoch: reclaimer.current_epoch(),
+                data: val,
+            }))
+        }
+    }
 
     #[test]
     fn test_concurrent_reader_writer() {
@@ -442,18 +450,18 @@ mod tests {
         const READERS: usize = 4;
 
         let reclaimer = Reclaimer::new();
-        let shared_ptr = AtomicPtr::new(reclaimer.alloc(0usize));
+        let shared_ptr = AtomicPtr::new(Block::alloc(&reclaimer, 0));
         let reads_completed = AtomicUsize::new(0);
 
         thread::scope(|scope| {
             // Writer thread: continuously updates the value
-            scope.spawn(|| {
+            scope.spawn(|| unsafe {
                 let mut ctx = reclaimer.claim_slot(5);
                 for i in 1..=UPDATES {
-                    let new_val = reclaimer.alloc(i);
+                    let new_val = Block::alloc(&reclaimer, i);
                     let old = shared_ptr.swap(new_val, SeqCst);
-                    if let Some(to_retire) = NonNull::new(old as *mut _) {
-                        ctx.retire(to_retire, LAYOUT, dealloc_box_ptr);
+                    if !old.is_null() {
+                        ctx.retire(old as *mut _, Block::LAYOUT, dealloc, (*old).birth_epoch);
                     }
                 }
             });
@@ -467,7 +475,7 @@ mod tests {
 
                     while last_seen < UPDATES {
                         if let Some(guard) = ctx.load(&shared_ptr, 1) {
-                            let val = *guard.as_ref();
+                            let val = guard.as_ref().data;
                             // Values should never decrease
                             assert!(
                                 val >= last_seen,
@@ -486,14 +494,14 @@ mod tests {
         });
 
         // Clean up the final value
-        let last = shared_ptr.load(Relaxed);
+        let last = shared_ptr.load(SeqCst);
         unsafe {
             assert_eq!((*last).data, UPDATES);
+            dealloc(last as *mut _, Block::LAYOUT);
         }
-        dealloc_box_ptr(NonNull::new(last as *mut _).unwrap(), LAYOUT);
 
-        println!("Total reads completed: {}", reads_completed.load(Relaxed));
-        println!("Epoch increments: {}", reclaimer.epoch.load(Relaxed));
+        println!("Total reads completed: {}", reads_completed.load(SeqCst));
+        println!("Epoch increments: {}", reclaimer.epoch.load(SeqCst));
     }
 
     #[test]
@@ -507,32 +515,28 @@ mod tests {
         basic_test_1::<64, 200>();
     }
 
-    const LAYOUT: Layout = Layout::new::<WithBirthEpoch<usize>>();
-
     fn basic_test_1<const THREADS: usize, const MAX_VAL: usize>() {
-        // basic tests:
-        // results1: each thread loads x, incrementing results[x.load()] by 1.
-        let results1: [AtomicUsize; MAX_VAL] = array::from_fn(|_| AtomicUsize::new(0));
-        // results2: each thread swaps x, incrementing results[x.swap(...)] by 1.
-        let results2: [AtomicUsize; MAX_VAL] = array::from_fn(|_| AtomicUsize::new(0));
+        // basic test:
+        // result: each thread swaps x, incrementing results[x.swap(...)] by 1.
+        let results: [AtomicUsize; MAX_VAL] = array::from_fn(|_| AtomicUsize::new(0));
         let reclaimer = Reclaimer::new();
 
-        let x = AtomicPtr::<WithBirthEpoch<usize>>::new(null_mut());
+        let x: AtomicPtr<Block> = AtomicPtr::default();
 
         let logic = || {
             let mut ctx = reclaimer.claim_slot(1);
             for val in 0..MAX_VAL {
                 if let Some(guard) = ctx.load(&x, 1) {
-                    results1[*guard.as_ref()].fetch_add(1, SeqCst);
+                    assert!(guard.as_ref().data < MAX_VAL);
                 }
-                let new_item = reclaimer.alloc(val);
-                let swapped = x.swap(new_item, SeqCst);
-                if let Some(to_retire) = NonNull::new(swapped as *mut _) {
+                let new_item = Block::alloc(&reclaimer, val);
+                let old = x.swap(new_item, SeqCst);
+                if !old.is_null() {
                     unsafe {
-                        results2[(*swapped).data].fetch_add(1, SeqCst);
+                        results[(*old).data].fetch_add(1, SeqCst);
+                        // immediately retire the object we swapped out
+                        ctx.retire(old as *mut u8, Block::LAYOUT, dealloc, (*old).birth_epoch);
                     }
-                    // immediately retire the object we swapped out
-                    ctx.retire(to_retire, LAYOUT, dealloc_box_ptr);
                 }
             }
         };
@@ -545,26 +549,17 @@ mod tests {
         });
 
         // there's still one object stored in x, clean it up for testing purposes
-        let last = x.swap(null_mut(), Relaxed);
+        let last = x.swap(null_mut(), SeqCst);
         unsafe {
-            results1[(*last).data].fetch_add(1, Relaxed);
-            results2[(*last).data].fetch_add(1, Relaxed);
-        }
-        dealloc_box_ptr(NonNull::new(last as *mut _).unwrap(), LAYOUT);
-
-        // sanity checks
-        let total = results1.iter().fold(0, |x, y| x + y.load(Relaxed));
-        assert_eq!(total, THREADS * MAX_VAL);
-        for item in results2.iter() {
-            assert_eq!(item.load(Relaxed), THREADS);
+            results[(*last).data].fetch_add(1, SeqCst);
+            dealloc(last as *mut u8, Block::LAYOUT);
         }
 
-        println!("Epoch increments: {}", reclaimer.epoch.load(Relaxed));
-    }
-
-    fn dealloc_box_ptr(p: NonNull<WithBirthEpoch<()>>, layout: Layout) {
-        unsafe {
-            dealloc(p.as_ptr() as *mut _, layout);
+        // check the result array to make sure the counts are correct
+        for item in results.iter() {
+            assert_eq!(item.load(SeqCst), THREADS);
         }
+
+        println!("Epoch increments: {}", reclaimer.epoch.load(SeqCst));
     }
 }
