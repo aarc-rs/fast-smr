@@ -17,4 +17,4 @@ jobs:
           cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test
       - run: rustup +nightly component add miri
-      - run: MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-many-seeds=0..4" cargo +nightly miri test
+      - run: MIRIFLAGS="-Zmiri-many-seeds=0..4" cargo +nightly miri test
