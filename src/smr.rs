@@ -3,9 +3,9 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::mem;
 use std::mem::zeroed;
-use std::ptr::{NonNull, null_mut};
-use std::sync::atomic::{AtomicPtr, AtomicU64};
+use std::ptr::{null_mut, NonNull};
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::sync::atomic::{AtomicPtr, AtomicU64};
 
 use crate::utils::ULL;
 
@@ -206,12 +206,11 @@ impl<'a> ThreadContext<'a> {
         let mut loaded_ptr = src.load(SeqCst);
 
         // publish the hazardous pointer, or check to see if anyone helped us
-        if let Err(helped) = self.slot.hazard_ptr.compare_exchange(
-            tag,
-            loaded_ptr as *mut _,
-            SeqCst,
-            SeqCst,
-        ) {
+        if let Err(helped) =
+            self.slot
+                .hazard_ptr
+                .compare_exchange(tag, loaded_ptr as *mut _, SeqCst, SeqCst)
+        {
             loaded_ptr = helped as *mut _;
         }
 
@@ -246,7 +245,8 @@ impl<'a> ThreadContext<'a> {
         f: unsafe fn(*mut u8, Layout),
         birth_epoch: u64,
     ) {
-        self.cleanup_counter.set((self.cleanup_counter.get() + 1) % self.cleanup_freq);
+        self.cleanup_counter
+            .set((self.cleanup_counter.get() + 1) % self.cleanup_freq);
         let retire_epoch = if self.cleanup_counter.get() == 0 {
             self.scan_and_cleanup();
             self.reclaimer.epoch.fetch_add(1, SeqCst)
@@ -299,7 +299,11 @@ impl<'a> ThreadContext<'a> {
                 // this is the check that ensures our hazard pointer can be dereferenced.
                 if slot.hazard_ptr.load(SeqCst) == loaded {
                     let tgt = (*help_ptr).load(SeqCst);
-                    if slot.hazard_ptr.compare_exchange(loaded, tgt, SeqCst, Relaxed).is_ok() {
+                    if slot
+                        .hazard_ptr
+                        .compare_exchange(loaded, tgt, SeqCst, Relaxed)
+                        .is_ok()
+                    {
                         // only need to snapshot the hazard ptr if our helping CAS succeeded
                         ptrs.push(tgt as *mut _);
                     }
@@ -459,16 +463,17 @@ impl Drop for RetiredFn {
 fn tag_convert<T>(ptr: *mut T) -> *mut T {
     // convenience function since there are no << or | operators defined on pointers
     let addr = ptr as usize;
-    ptr.wrapping_byte_sub(addr).wrapping_byte_add((addr << 1) | 1)
+    ptr.wrapping_byte_sub(addr)
+        .wrapping_byte_add((addr << 1) | 1)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{array, thread};
     use std::alloc::{dealloc, Layout};
     use std::ptr::null_mut;
-    use std::sync::atomic::{AtomicPtr, AtomicUsize};
     use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::atomic::{AtomicPtr, AtomicUsize};
+    use std::{array, thread};
 
     use crate::smr::Reclaimer;
 
