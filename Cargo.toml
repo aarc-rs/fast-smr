@@ -9,3 +9,4 @@ license = "MIT"
 keywords = ["smr", "thread-safe", "sync", "lock-free"]
 categories = ["concurrency", "memory-management", "data-structures", "algorithms"]
 exclude = [".github/", ".gitignore", "target/"]
+rust-version = "1.91.1"
