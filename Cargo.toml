@@ -1,6 +1,6 @@
 [package]
 name = "fast-smr"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Toward fast, wait-free, portable, and robust memory reclamation."
 homepage = "https://github.com/aarc-rs/"
