@@ -1,11 +1,11 @@
 use std::alloc::Layout;
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::mem;
 use std::mem::zeroed;
-use std::ptr::{null_mut, NonNull};
-use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::ptr::{NonNull, null_mut};
 use std::sync::atomic::{AtomicPtr, AtomicU64};
+use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 
 use crate::utils::ULL;
 
@@ -14,31 +14,36 @@ const SLOTS_PER_NODE: usize = 8;
 pub struct Reclaimer {
     slots: ULL<Slot, SLOTS_PER_NODE>,
     epoch: AtomicU64,
-    tag: AtomicU64,
+    tag: AtomicPtr<u8>,
 }
 
 impl Reclaimer {
     pub const fn new() -> Self {
-        unsafe { zeroed() }
+        Self {
+            slots: unsafe { zeroed() },
+            epoch: AtomicU64::new(1),
+            tag: AtomicPtr::new(null_mut::<u8>().wrapping_byte_add(1)),
+        }
     }
 
-    pub fn claim_slot(&self, cleanup_freq: usize) -> ThreadContext<'_> {
+    pub fn get_ctx(&self, cleanup_freq: usize) -> ThreadContext<'_> {
         let slot = self.slots.apply(Slot::try_claim);
         ThreadContext {
             reclaimer: self,
             slot,
             cleanup_freq,
-            cleanup_counter: 0,
+            cleanup_counter: Cell::new(0),
             limbo_list: unsafe {
                 if let Some(b) = mem::take(&mut *slot.limbo_list.get()) {
-                    b.into_vec()
+                    RefCell::new(b.into_vec())
                 } else {
-                    Vec::default()
+                    RefCell::new(Vec::default())
                 }
             },
-            counts: RefCell::new(Default::default()),
-            snapshot_intervals: vec![],
-            snapshot_ptrs: vec![],
+            counts: RefCell::new(VecDeque::default()),
+            snapshot_intervals: RefCell::new(vec![]),
+            snapshot_ptrs: RefCell::new(vec![]),
+            ready_to_drop: RefCell::new(vec![]),
         }
     }
 
@@ -97,52 +102,73 @@ pub struct ThreadContext<'a> {
     slot: &'a Slot,
 
     cleanup_freq: usize,
-    cleanup_counter: usize,
+    cleanup_counter: Cell<usize>,
 
-    limbo_list: Vec<RetiredFn>,
+    limbo_list: RefCell<Vec<RetiredFn>>,
 
     // a monotonically increasing queue consisting of (epoch, count) tuples.
     counts: RefCell<VecDeque<(u64, usize)>>,
 
     // reusable lists for storing snapshots when scanning slots during retirement.
-    snapshot_intervals: Vec<(u64, u64)>,
-    snapshot_ptrs: Vec<*mut u8>,
+    snapshot_intervals: RefCell<Vec<(u64, u64)>>,
+    snapshot_ptrs: RefCell<Vec<*mut u8>>,
+
+    ready_to_drop: RefCell<Vec<RetiredFn>>,
 }
 
 impl<'a> ThreadContext<'a> {
-    pub fn load<T>(&mut self, src: &AtomicPtr<T>, attempts: usize) -> Option<Guard<'a, '_, T>> {
+    pub fn load<T>(&self, src: &AtomicPtr<T>, attempts: usize) -> Option<Guard<'a, T>> {
         match NonNull::new(src.load(SeqCst)) {
             Some(initial) => self.protect(src, initial, attempts),
             None => None,
         }
     }
 
-    fn protect<T>(
-        &mut self,
+    pub fn must_protect<T>(&self, ptr: NonNull<T>) -> Guard<'a, T> {
+        let ctx = NonNull::from(self);
+        let mut counts = self.counts.borrow_mut();
+        let epoch = self.reclaimer.epoch.load(SeqCst);
+
+        // if curr_epoch was already protected, simply increment the count in our local tracker.
+        if let Some(back) = counts.back_mut() {
+            if back.0 == epoch {
+                back.1 += 1;
+                return Guard { ctx, epoch, ptr };
+            }
+        }
+
+        self.slot.end_epoch.store(epoch, SeqCst);
+        if counts.is_empty() {
+            // this is our first reservation, so start_epoch must also be updated.
+            self.slot.start_epoch.store(epoch, SeqCst);
+        }
+        counts.push_back((epoch, 1));
+        Guard { ctx, epoch, ptr }
+    }
+
+    pub fn protect<T>(
+        &self,
         src: &AtomicPtr<T>,
         initial: NonNull<T>,
         attempts: usize,
-    ) -> Option<Guard<'a, '_, T>> {
+    ) -> Option<Guard<'a, T>> {
+        let ctx = NonNull::from(self);
         let mut counts = self.counts.borrow_mut();
         let mut ptr = initial;
-        let mut curr_epoch = self.reclaimer.epoch.load(SeqCst);
+        let mut epoch = self.reclaimer.epoch.load(SeqCst);
         let mut initial_end_epoch = Slot::NO_RESERVE;
 
         // if curr_epoch was already protected, simply increment the count in our local tracker.
         if let Some(back) = counts.back_mut() {
             initial_end_epoch = back.0;
-            if initial_end_epoch == curr_epoch {
+            if initial_end_epoch == epoch {
                 back.1 += 1;
-                return Some(Guard {
-                    ctx: self,
-                    epoch: curr_epoch,
-                    ptr,
-                });
+                return Some(Guard { ctx, epoch, ptr });
             }
         }
 
         // set end_epoch to curr_epoch in accordance with 2GEIBR
-        self.slot.end_epoch.store(curr_epoch, SeqCst);
+        self.slot.end_epoch.store(epoch, SeqCst);
 
         // try the fast path
         for _ in 0..attempts {
@@ -154,22 +180,18 @@ impl<'a> ThreadContext<'a> {
                     return None;
                 }
             };
-            self.slot.end_epoch.store(curr_epoch, SeqCst);
+            self.slot.end_epoch.store(epoch, SeqCst);
 
             let reloaded_epoch = self.reclaimer.epoch.load(SeqCst);
-            if curr_epoch == reloaded_epoch {
+            if epoch == reloaded_epoch {
                 if counts.is_empty() {
                     // this is our first reservation, so start_epoch must also be updated.
-                    self.slot.start_epoch.store(curr_epoch, SeqCst);
+                    self.slot.start_epoch.store(epoch, SeqCst);
                 }
-                counts.push_back((curr_epoch, 1));
-                return Some(Guard {
-                    ctx: self,
-                    epoch: curr_epoch,
-                    ptr,
-                });
+                counts.push_back((epoch, 1));
+                return Some(Guard { ctx, epoch, ptr });
             }
-            curr_epoch = reloaded_epoch;
+            epoch = reloaded_epoch;
         }
 
         // fall back to the slow path. first, publish the parent block.
@@ -177,15 +199,15 @@ impl<'a> ThreadContext<'a> {
         self.slot.help_ptr.store(help, SeqCst);
 
         // set the low bit to signal that we need help
-        let tag = (self.reclaimer.tag.fetch_add(1, SeqCst) << 1) | 1;
-        self.slot.hazard_ptr.store(tag as *mut _, SeqCst);
+        let tag = tag_convert(self.reclaimer.tag.fetch_byte_add(1, SeqCst));
+        self.slot.hazard_ptr.store(tag, SeqCst);
 
         // load the target ourselves
         let mut loaded_ptr = src.load(SeqCst);
 
         // publish the hazardous pointer, or check to see if anyone helped us
         if let Err(helped) = self.slot.hazard_ptr.compare_exchange(
-            tag as *mut _,
+            tag,
             loaded_ptr as *mut _,
             SeqCst,
             SeqCst,
@@ -205,38 +227,35 @@ impl<'a> ThreadContext<'a> {
 
         // protect the current epoch; the target is guaranteed to be alive during this epoch
         // because we already protected it using the hazard pointer
-        curr_epoch = self.reclaimer.epoch.load(SeqCst);
-        self.slot.end_epoch.store(curr_epoch, SeqCst);
+        epoch = self.reclaimer.epoch.load(SeqCst);
+        self.slot.end_epoch.store(epoch, SeqCst);
         self.slot.hazard_ptr.store(null_mut(), SeqCst); // clear the help flag
         if counts.is_empty() {
             // this is our first reservation, so start_epoch must also be updated.
-            self.slot.start_epoch.store(curr_epoch, SeqCst);
+            self.slot.start_epoch.store(epoch, SeqCst);
         }
-        counts.push_back((curr_epoch, 1));
-        Some(Guard {
-            ctx: self,
-            epoch: curr_epoch,
-            ptr,
-        })
+        counts.push_back((epoch, 1));
+        Some(Guard { ctx, epoch, ptr })
     }
 
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn retire(
-        &mut self,
+        &self,
         ptr: *mut u8,
         layout: Layout,
         f: unsafe fn(*mut u8, Layout),
         birth_epoch: u64,
     ) {
-        self.cleanup_counter = (self.cleanup_counter + 1) % self.cleanup_freq;
-        let retire_epoch = if self.cleanup_counter == 0 {
+        self.cleanup_counter.set((self.cleanup_counter.get() + 1) % self.cleanup_freq);
+        let retire_epoch = if self.cleanup_counter.get() == 0 {
             self.scan_and_cleanup();
             self.reclaimer.epoch.fetch_add(1, SeqCst)
         } else {
             self.reclaimer.epoch.load(SeqCst)
         };
+        let mut limbo_list = self.limbo_list.borrow_mut();
         let span = (birth_epoch, retire_epoch);
-        self.limbo_list.push(RetiredFn {
+        limbo_list.push(RetiredFn {
             ptr,
             layout,
             f,
@@ -245,8 +264,16 @@ impl<'a> ThreadContext<'a> {
     }
 
     #[allow(clippy::missing_safety_doc)]
-    unsafe fn scan_and_cleanup(&mut self) {
-        // scan all slots.
+    unsafe fn scan_and_cleanup(&self) {
+        let Ok(mut ready_to_drop) = self.ready_to_drop.try_borrow_mut() else {
+            // println!("detected recursive call to scan_and_cleanup.");
+            return;
+        };
+        let mut limbo_list = self.limbo_list.borrow_mut();
+        let mut intervals = self.snapshot_intervals.borrow_mut();
+        let mut ptrs = self.snapshot_ptrs.borrow_mut();
+
+        // iterate over all slots and take snapshots of all reservations.
         for slot in self.reclaimer.slots.into_iter() {
             let end = slot.end_epoch.load(SeqCst);
             if end == Slot::UNCLAIMED || end == Slot::NO_RESERVE {
@@ -257,7 +284,7 @@ impl<'a> ThreadContext<'a> {
                 // this slot has one reservation, defined by end_epoch.
                 start = end;
             }
-            self.snapshot_intervals.push((start, end));
+            intervals.push((start, end));
 
             // helping procedure
             let loaded = slot.hazard_ptr.load(SeqCst);
@@ -267,17 +294,19 @@ impl<'a> ThreadContext<'a> {
                 // if the low bit is set, they need help
                 let help_ptr = slot.help_ptr.load(SeqCst);
                 self.slot.hazard_ptr.store(help_ptr as *mut _, SeqCst);
+
+                // make sure the tag didn't change. if it did, they no longer need help.
+                // this is the check that ensures our hazard pointer can be dereferenced.
                 if slot.hazard_ptr.load(SeqCst) == loaded {
-                    // make sure it didn't change. if it did, they no longer need help.
                     let tgt = (*help_ptr).load(SeqCst);
-                    _ = slot
-                        .hazard_ptr
-                        .compare_exchange(loaded, tgt, SeqCst, Relaxed);
-                    self.snapshot_ptrs.push(tgt as *mut _);
+                    if slot.hazard_ptr.compare_exchange(loaded, tgt, SeqCst, Relaxed).is_ok() {
+                        // only need to snapshot the hazard ptr if our helping CAS succeeded
+                        ptrs.push(tgt as *mut _);
+                    }
                 }
                 self.slot.hazard_ptr.store(null_mut(), SeqCst);
             } else {
-                self.snapshot_ptrs.push(loaded as *mut _);
+                ptrs.push(loaded as *mut _);
             }
         }
 
@@ -301,14 +330,13 @@ impl<'a> ThreadContext<'a> {
         */
 
         let mut i = 0;
-        while i < self.limbo_list.len() {
-            let mut has_conflict = self
-                .snapshot_intervals
+        while i < limbo_list.len() {
+            let mut has_conflict = intervals
                 .iter()
-                .any(|x| intervals_overlap(self.limbo_list[i].span, *x));
-            for snapshot_ptr in self.snapshot_ptrs.iter() {
-                let block_start = self.limbo_list[i].ptr as usize;
-                let block_end = block_start + self.limbo_list[i].layout.size();
+                .any(|x| intervals_overlap(limbo_list[i].span, *x));
+            for snapshot_ptr in ptrs.iter() {
+                let block_start = limbo_list[i].ptr as usize;
+                let block_end = block_start + limbo_list[i].layout.size();
                 let hazard_addr = *snapshot_ptr as usize;
                 has_conflict |= (block_start <= hazard_addr) && (hazard_addr < block_end);
                 if has_conflict {
@@ -318,20 +346,28 @@ impl<'a> ThreadContext<'a> {
             if has_conflict {
                 i += 1;
             } else {
-                self.limbo_list.swap_remove(i);
+                ready_to_drop.push(limbo_list.swap_remove(i));
             }
         }
 
-        self.snapshot_intervals.clear();
-        self.snapshot_ptrs.clear();
+        intervals.clear();
+        ptrs.clear();
+
+        // drop the borrow to allow re-entrant retire calls (chained retirement)
+        drop(limbo_list);
+
+        // actually execute the retired functions by dropping them
+        ready_to_drop.clear();
     }
 }
 
 impl<'a> Drop for ThreadContext<'a> {
     fn drop(&mut self) {
+        if !self.counts.borrow().is_empty() {
+            panic!("dropped ThreadContext with outstanding Guard objects.")
+        }
         unsafe {
-            self.scan_and_cleanup();
-            *self.slot.limbo_list.get() = Some(mem::take(&mut self.limbo_list).into_boxed_slice());
+            *self.slot.limbo_list.get() = Some(self.limbo_list.take().into_boxed_slice());
         }
         self.slot.end_epoch.store(Slot::UNCLAIMED, SeqCst);
     }
@@ -341,22 +377,28 @@ fn intervals_overlap(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 <= b.1 && b.0 <= a.1
 }
 
-pub struct Guard<'a: 'b, 'b, T> {
-    ctx: &'b ThreadContext<'a>,
+pub struct Guard<'a, T> {
+    ctx: NonNull<ThreadContext<'a>>,
     ptr: NonNull<T>,
     epoch: u64,
 }
 
-impl<'a: 'b, 'b, T> AsRef<T> for Guard<'a, 'b, T> {
+impl<'a, T> Guard<'a, T> {
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.as_ptr()
+    }
+}
+
+impl<'a, T> AsRef<T> for Guard<'a, T> {
     fn as_ref(&self) -> &T {
         unsafe { &(*self.ptr.as_ptr()) }
     }
 }
 
-impl<'a: 'b, 'b, T> Drop for Guard<'a, 'b, T> {
+impl<'a, T> Drop for Guard<'a, T> {
     fn drop(&mut self) {
-        let mut counts = self.ctx.counts.borrow_mut();
-        debug_assert_ne!(counts.len(), 0);
+        let ctx = unsafe { &(*self.ctx.as_ptr()) };
+        let mut counts = ctx.counts.borrow_mut();
 
         // decrement the count.
         let pair = counts.iter_mut().find(|(e, _)| *e == self.epoch).unwrap();
@@ -383,20 +425,16 @@ impl<'a: 'b, 'b, T> Drop for Guard<'a, 'b, T> {
 
         if counts.is_empty() {
             // we have no more reservations; zero out our interval.
-            self.ctx.slot.end_epoch.store(Slot::NO_RESERVE, SeqCst);
-            self.ctx.slot.start_epoch.store(Slot::NO_RESERVE, SeqCst);
+            ctx.slot.end_epoch.store(Slot::NO_RESERVE, SeqCst);
+            ctx.slot.start_epoch.store(Slot::NO_RESERVE, SeqCst);
         } else {
             if start_epoch_changed {
-                self.ctx
-                    .slot
-                    .start_epoch
-                    .store(counts.front().unwrap().0, SeqCst);
+                let start_epoch = counts.front().unwrap().0;
+                ctx.slot.start_epoch.store(start_epoch, SeqCst);
             }
             if end_epoch_changed {
-                self.ctx
-                    .slot
-                    .end_epoch
-                    .store(counts.back().unwrap().0, SeqCst);
+                let end_epoch = counts.back().unwrap().0;
+                ctx.slot.end_epoch.store(end_epoch, SeqCst);
             }
         }
     }
@@ -417,13 +455,20 @@ impl Drop for RetiredFn {
     }
 }
 
+#[inline]
+fn tag_convert<T>(ptr: *mut T) -> *mut T {
+    // convenience function since there are no << or | operators defined on pointers
+    let addr = ptr as usize;
+    ptr.wrapping_byte_sub(addr).wrapping_byte_add((addr << 1) | 1)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{array, thread};
     use std::alloc::{dealloc, Layout};
     use std::ptr::null_mut;
-    use std::sync::atomic::Ordering::SeqCst;
     use std::sync::atomic::{AtomicPtr, AtomicUsize};
-    use std::{array, thread};
+    use std::sync::atomic::Ordering::SeqCst;
 
     use crate::smr::Reclaimer;
 
@@ -456,7 +501,7 @@ mod tests {
         thread::scope(|scope| {
             // Writer thread: continuously updates the value
             scope.spawn(|| unsafe {
-                let mut ctx = reclaimer.claim_slot(5);
+                let ctx = reclaimer.get_ctx(1);
                 for i in 1..=UPDATES {
                     let new_val = Block::alloc(&reclaimer, i);
                     let old = shared_ptr.swap(new_val, SeqCst);
@@ -469,7 +514,7 @@ mod tests {
             // Reader threads: continuously read and verify monotonic increases
             for _ in 0..READERS {
                 scope.spawn(|| {
-                    let mut ctx = reclaimer.claim_slot(1);
+                    let ctx = reclaimer.get_ctx(1);
                     let mut last_seen = 0;
                     let mut local_reads = 0;
 
@@ -524,7 +569,7 @@ mod tests {
         let x: AtomicPtr<Block> = AtomicPtr::default();
 
         let logic = || {
-            let mut ctx = reclaimer.claim_slot(1);
+            let ctx = reclaimer.get_ctx(1);
             for val in 0..MAX_VAL {
                 if let Some(guard) = ctx.load(&x, 1) {
                     assert!(guard.as_ref().data < MAX_VAL);
